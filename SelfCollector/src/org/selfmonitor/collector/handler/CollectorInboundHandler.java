@@ -13,15 +13,39 @@
 package org.selfmonitor.collector.handler;
 
 import com.alibaba.fastjson.JSON;
-import io.netty.buffer.ByteBuf;
-import io.netty.channel.ChannelHandler;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInboundHandlerAdapter;
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONException;
+import com.alibaba.fastjson.JSONObject;
+import io.netty.channel.*;
+import io.netty.handler.codec.http.*;
+import io.netty.handler.codec.http.multipart.DefaultHttpDataFactory;
+import io.netty.handler.codec.http.multipart.HttpDataFactory;
+import io.netty.handler.codec.http.multipart.HttpPostRequestDecoder;
+import io.netty.util.CharsetUtil;
+import org.selfmonitor.collector.MessageType;
+import org.selfmonitor.collector.utils.MqUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.nio.ByteBuffer;
+import io.netty.buffer.ByteBuf;
+
+import java.util.Collections;
+import java.util.Set;
+
+import static io.netty.buffer.Unpooled.copiedBuffer;
+import static io.netty.handler.codec.http.HttpHeaderNames.*;
 
 @ChannelHandler.Sharable
 public class CollectorInboundHandler extends ChannelInboundHandlerAdapter {
+
+    private final Logger log = LoggerFactory.getLogger(this.getClass());
+
+    private HttpPostRequestDecoder decoder;
+    private FullHttpRequest fullHttpRequest;
+    private final StringBuilder responseContent = new StringBuilder();
+    private static final HttpDataFactory factory = new DefaultHttpDataFactory(DefaultHttpDataFactory.MINSIZE);
+
+
     public CollectorInboundHandler() {
         super();
     }
@@ -43,20 +67,65 @@ public class CollectorInboundHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-        super.channelInactive(ctx);
+        if (decoder != null) {
+            decoder.cleanFiles();
+        }
     }
 
+    /***
+     * Receive message and put it into MQ
+     * @param ctx
+     * @param msg
+     * @throws Exception
+     */
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        System.out.println("Json:"+msg);
-        if(msg instanceof String){
-            System.out.println("String:"+msg);
+        if(msg instanceof FullHttpRequest){
+            fullHttpRequest = (FullHttpRequest)msg;
+            ByteBuf msgBuf = fullHttpRequest.content();
+            String msgStr = msgBuf.toString(io.netty.util.CharsetUtil.UTF_8);
+            try {
+                MqUtils mqUtils = new MqUtils();
+                if(msgStr.startsWith("[")) {
+                    JSONArray msgJson = JSON.parseArray(msgStr);
+                    for (int i = 0; i < msgJson.size(); i++) {
+                        JSONObject data = msgJson.getJSONObject(i);
+                        MessageType type = MessageType.valueOf(data.getString("type"));
+                        String topic = data.getString("topic");
+                        if (topic != null && type != null) {
+                            if (!mqUtils.mqPut(msgStr, topic, type.getName())) {
+                                responseContent.append("MQ Put Error:" + data.toJSONString());
+                            }
+                        }
+                    }
+                }
+                else {
+                    JSONObject data = JSON.parseObject(msgStr);
+                    MessageType type = MessageType.valueOf(data.getString("type"));
+                    String topic = data.getString("topic");
+                    if (topic != null && type != null) {
+                        if (!mqUtils.mqPut(msgStr, topic, type.getName())) {
+                            responseContent.append("MQ Put Error:" + data.toJSONString());
+                        }
+                    }
+                }
+                responseContent.append("{\"return_code\":200}");
+                writeResponse(ctx.channel());
+            }
+            catch (JSONException jsonException){
+                //Write invalid Msg Error to HTTPResponse
+                log.error("Invalid Json String Received:"+jsonException.getLocalizedMessage()+" Origin Message:"+msgStr);
+                responseContent.append("Invalid Json String Received\n");
+                writeResponse(ctx.channel());
+            }
+            finally {
+                msgBuf.release();
+            }
+
         }
-        else if(msg instanceof ByteBuffer){
-            System.out.println("BB:"+msg);
-        }
-        else if(msg instanceof JSON){
-            System.out.println("Json:"+((ByteBuf) msg).toString());
+        else {
+            log.error("Unknow Request:"+msg.toString());
+            ctx.close();
         }
 
     }
@@ -68,6 +137,51 @@ public class CollectorInboundHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-        super.exceptionCaught(ctx, cause);
+        log.error(cause.getLocalizedMessage());
+        ctx.close();
+    }
+
+    private void writeResponse(Channel channel){
+
+
+        // Convert the response content to a ChannelBuffer.
+        ByteBuf buf = copiedBuffer(responseContent.toString(), CharsetUtil.UTF_8);
+
+        responseContent.setLength(0);
+
+        boolean close = fullHttpRequest.headers().contains(CONNECTION, HttpHeaders.Values.CLOSE, true)
+                || fullHttpRequest.getProtocolVersion().equals(HttpVersion.HTTP_1_0)
+                && !fullHttpRequest.headers().contains(CONNECTION, HttpHeaders.Values.KEEP_ALIVE, true);
+
+
+        // Build the response object.
+        FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK, buf);
+        response.headers().set(CONTENT_TYPE, "text/json; charset=UTF-8");
+
+        if (!close) {
+            // There's no need to add 'Content-Length' header
+            // if this is the last response.
+            response.headers().set(CONTENT_LENGTH, buf.readableBytes());
+        }
+
+        Set<Cookie> cookies;
+
+        String value = fullHttpRequest.headers().get(COOKIE);
+        if (value == null) {
+            cookies = Collections.emptySet();
+        } else {
+            cookies = CookieDecoder.decode(value);
+        }
+        if (!cookies.isEmpty()) {
+            // Reset the cookies if necessary.
+            for (Cookie cookie : cookies) {
+                response.headers().add(SET_COOKIE, ServerCookieEncoder.encode(cookie));
+            }
+        }
+        // Write the response.
+        ChannelFuture future = channel.writeAndFlush(response);
+        // Close the connection after the write operation is done if necessary.
+        if (close) future.addListener(ChannelFutureListener.CLOSE);
+
     }
 }
